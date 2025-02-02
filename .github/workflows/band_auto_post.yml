@@ -1,0 +1,348 @@
+name: Band Auto Posting
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+        
+    - name: Git setup
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git config --global --add safe.directory '*'
+        git checkout -b main || git checkout main
+        
+    - name: Setup Chrome and profile
+      run: |
+        # 새로운 프로필 디렉토리 생성
+        sudo rm -rf chrome_profile
+        sudo mkdir -p chrome_profile/Default
+        
+        # 프로필 복사
+        if [ -d "profile_backup" ]; then
+          sudo cp -r profile_backup/* chrome_profile/
+        fi
+        
+        # 권한 설정
+        sudo chown -R $USER:$USER chrome_profile
+        sudo chmod -R 777 chrome_profile
+        
+        echo "Chrome profile 상태:"
+        ls -la chrome_profile
+
+    - name: Check authentication data
+      run: |
+        if [ ! -d "chrome_profile" ]; then
+          echo "::error::Chrome 프로필을 찾을 수 없습니다."
+          exit 1
+        else
+          echo "✅ 로컬 Chrome 프로필 사용"
+          echo "프로필 경로: $(pwd)/chrome_profile"
+          echo "프로필 내용:"
+          ls -la chrome_profile/
+        fi
+        
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+        
+    - name: Install Chrome
+      run: |
+        wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add - 
+        sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list'
+        sudo apt-get update
+        sudo apt-get install google-chrome-stable xvfb
+        
+    - name: Install dependencies
+      run: |
+        # 시스템 Python 패키지 설치
+        sudo apt-get update
+        sudo apt-get install -y python3-pip python3-venv
+        
+        # venv 생성 및 활성화
+        python -m venv .venv
+        source .venv/bin/activate
+        
+        # pip 업그레이드 및 패키지 설치
+        python -m pip install --upgrade pip wheel setuptools
+        pip install --no-cache-dir \
+          selenium==4.15.2 \
+          requests==2.31.0 \
+          beautifulsoup4==4.12.2 \
+          webdriver_manager==4.0.1 \
+          PyGithub==2.1.1
+        
+        # 설치된 패키지 확인
+        pip list
+        
+        # requirements.txt 설치 (백업)
+        if [ -f "requirements.txt" ]; then
+          pip install -r requirements.txt
+        fi
+
+    - name: Update submodules
+      run: |
+        git submodule update --init --recursive
+        git submodule foreach git pull origin main
+
+    - name: Create config file
+      env:
+        EMAIL: ${{ secrets.EMAIL }}
+        PASSWORD: ${{ secrets.PASSWORD }}
+        POST_URL: ${{ secrets.URL }}
+        TITLE: ${{ secrets.TITLE }}
+        POST_TIME: ${{ secrets.TIME }}
+        INTERVAL: ${{ secrets.INTERVAL }}
+      run: |
+        cat > config.json << EOL
+        {
+          "email": "$EMAIL",
+          "password": "$PASSWORD",
+          "post_url": "$POST_URL",
+          "title": "$TITLE",
+          "post_time": "$POST_TIME",
+          "interval_hours": $INTERVAL,
+          "bands": []
+        }
+        EOL
+        cat config.json
+
+    - name: Download saved cookies
+      uses: actions/download-artifact@v4
+      with:
+        name: band-cookies
+        path: .
+      continue-on-error: true
+
+    - name: Check cookie file
+      run: |
+        if [ ! -f "band_cookies.json" ]; then
+          echo "::error::쿠키 파일이 없습니다. 먼저 로컬에서 band_auto_poster.py를 실행하여 쿠키를 생성해주세요."
+          exit 1
+        fi
+
+    - name: Load band URLs
+      run: |
+        if [ -f "band_urls.json" ]; then
+          echo "Found saved band URLs"
+          cat band_urls.json
+        else
+          echo "No saved band URLs found"
+        fi
+
+    - name: Setup authentication data
+      run: |
+        # Chrome 데이터 디렉토리 설정
+        export CHROME_USER_DATA_DIR="/tmp/chrome-data"
+        sudo mkdir -p "$CHROME_USER_DATA_DIR"
+        sudo cp -r chrome_profile/* "$CHROME_USER_DATA_DIR/"
+        sudo chown -R $USER:$USER "$CHROME_USER_DATA_DIR"
+        sudo chmod -R 777 "$CHROME_USER_DATA_DIR"
+
+    - name: Install VPN dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y shadowsocks-libev
+
+    - name: Setup VPN configuration
+      run: |
+        # Create shadowsocks config file
+        cat > vpn_config.json << EOF
+        {
+            "server":"34.64.189.76",
+            "server_port":16978,
+            "local_address":"127.0.0.1",
+            "local_port":1080,
+            "password":"Nsy5l8wxxzHg4CXPKwEw6S",
+            "timeout":300,
+            "method":"chacha20-ietf-poly1305"
+        }
+        EOF
+        
+        # Create VPN control script
+        cat > vpn.sh << 'EOF'
+        #!/bin/bash
+        
+        start_vpn() {
+          ss-local -c vpn_config.json -v &
+          sleep 5
+          echo "VPN started"
+        }
+        
+        stop_vpn() {
+          pkill ss-local
+          echo "VPN stopped"
+        }
+        
+        case "$1" in
+          start)
+            start_vpn
+            ;;
+          stop)
+            stop_vpn
+            ;;
+          *)
+            echo "Usage: $0 {start|stop}"
+            exit 1
+        esac
+        EOF
+        
+        chmod +x vpn.sh
+
+    - name: Setup VPN and check IP
+      run: |
+        # VPN 설정 및 시작
+        ./vpn.sh start
+        sleep 5
+        
+        # IP 확인
+        echo "VPN 연결 전 IP:"
+        curl ifconfig.me
+        
+        echo "VPN 연결 후 IP:"
+        curl -x socks5h://127.0.0.1:1080 ifconfig.me
+        
+        # 한국 IP인지 확인
+        CURRENT_IP=$(curl -x socks5h://127.0.0.1:1080 ifconfig.me)
+        IP_COUNTRY=$(curl -s -x socks5h://127.0.0.1:1080 http://ip-api.com/json/$CURRENT_IP | jq -r '.countryCode')
+        
+        if [ "$IP_COUNTRY" != "KR" ]; then
+          echo "::error::한국 IP가 아닙니다 (현재: $IP_COUNTRY)"
+          exit 1
+        fi
+        
+        echo "✅ 한국 IP 확인됨: $CURRENT_IP"
+
+    - name: Verify Korean IP before running
+      run: |
+        echo "현재 IP 재확인:"
+        CURRENT_IP=$(curl -x socks5h://127.0.0.1:1080 ifconfig.me)
+        echo $CURRENT_IP
+        
+        IP_INFO=$(curl -s -x socks5h://127.0.0.1:1080 http://ip-api.com/json/$CURRENT_IP)
+        echo "IP 정보:"
+        echo $IP_INFO
+        
+        COUNTRY=$(echo $IP_INFO | jq -r '.countryCode')
+        if [ "$COUNTRY" != "KR" ]; then
+          echo "::error::한국 IP로 연결되지 않았습니다!"
+          echo "현재 국가: $COUNTRY"
+          exit 1
+        fi
+
+    - name: Setup Chrome profile directory
+      run: |
+        # 시스템 Chrome 프로필 디렉토리 설정
+        CHROME_DIR="/home/runner/.config/google-chrome"
+        sudo mkdir -p "$CHROME_DIR"
+        
+        # Default 프로필 디렉토리 생성
+        sudo mkdir -p "$CHROME_DIR/Default"
+        
+        # 권한 설정
+        sudo chown -R $USER:$USER "$CHROME_DIR"
+        sudo chmod -R 777 "$CHROME_DIR"
+        
+        echo "Chrome 프로필 디렉토리 생성됨: $CHROME_DIR"
+        ls -la "$CHROME_DIR"
+
+    - name: Setup Chrome profile directory
+      run: |
+        # AppData 디렉토리 구조 생성
+        mkdir -p "AppData/Local/Google/Chrome/User Data/Default"
+        
+        # 권한 설정
+        chmod -R 777 AppData
+        
+        echo "Chrome 프로필 디렉토리 생성됨"
+        ls -la "AppData/Local/Google/Chrome/User Data/Default"
+
+    - name: Run band poster with auth data
+      run: |
+        # venv 활성화
+        source .venv/bin/activate
+        
+        # Chrome 프로세스 종료
+        sudo killall -9 chrome chromium chromium-browser google-chrome || true
+        
+        # Chrome 시스템 프로필 경로
+        CHROME_DIR="/home/runner/.config/google-chrome"
+        export CHROME_USER_DATA_DIR="$CHROME_DIR"
+        
+        # 실행
+        xvfb-run --server-args="-screen 0 1920x1080x24" \
+          --auto-servernum \
+          python run_band_poster.py
+
+    - name: Disconnect VPN
+      if: always()
+      run: |
+        ./vpn.sh stop
+        echo "VPN 연결 해제됨"
+
+    - name: Save updated auth data
+      if: success()
+      run: |
+        if [ -f "band_cookies.json" ]; then
+          cp band_cookies.json band_cookies.json.new
+        fi
+        if [ -d "chrome_profile" ]; then
+          cp -r chrome_profile chrome_profile.new
+        fi
+
+    - name: Upload auth data
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: auth-data
+        path: |
+          band_cookies.json.new
+          chrome_profile.new/
+        retention-days: 7
+        
+    - name: Save profile and cookies
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: chrome-data
+        path: |
+          chrome_profile/
+          band_cookies.json
+        retention-days: 7
+        
+    - name: Save cookies
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: band-cookies
+        path: band_cookies.json
+        retention-days: 30
+        
+    - name: Commit and push changes
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cd $GITHUB_WORKSPACE
+        git add -A
+        git status
+        if ! git diff --quiet HEAD; then
+          git commit -m "Update chrome profile [skip ci]"
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git HEAD:main -f
+        else
+          echo "No changes to commit"
+        fi
